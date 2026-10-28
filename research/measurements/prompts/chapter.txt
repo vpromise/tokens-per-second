@@ -1,0 +1,260 @@
+Here is a chapter from my course notes. Read it carefully; I will ask questions about it.
+
+## §2 Arithmetic intensity and the roofline
+
+### Mechanism
+Every kernel does some FLOPs and moves some bytes between HBM (or unified DRAM) and the compute units. **Arithmetic intensity** I = FLOPs ÷ bytes.
+- The hardware has a **ridge point** I* = C ÷ BW.
+- If I < I*, the kernel is **memory-bound**: its time is set by bytes ÷ BW.
+- If I > I*, it is **compute-bound**: its time is set by FLOPs ÷ C.
+
+In a decoder at batch B, each weight (b bytes) is read once per step and used for 2B FLOPs (one multiply-add per sequence). With BF16 (b = 2), the intensity of the linear layers is **I ≈ B FLOPs/byte**. So:
+- **Batch-1 decode** has I ≈ 1, which is hopelessly memory-bound.
+- **Prefill** of n tokens has I ≈ n. A 2,048-token prompt is far above the ridge, so it is compute-bound.
+
+### Formulas
+- **FLOPs per token (forward):** ≈ 2P.
+  - kipply: "We do 2⋅P flops of operations, which can be intuited by the fact that we matmul through all the parameters."
+  - Attention adds ≈ 4·L·T·d FLOPs per token at context T. This is negligible at short T.
+- **Bytes per decode step:** ≈ P·b_w + B·T·kv_bytes_per_token (+ small activations).
+- **Step time.** JAX scaling book: "Theoretical minimum step time = (Batch × KV_cache_size + Param_size) / HBM bandwidth" (memory-bound regime). In general:
+  - T_step ≈ B·KV/BW + max(2·B·P/C, P·b/BW)
+- **Batch-1 decode ceiling (tokens/s):** ≈ BW ÷ (P·b + T·kv_per_token).
+- **Prefill time:** ≈ 2·P·n_prompt ÷ (C·MFU), plus attention (§11).
+- **Critical batch** (where decode turns compute-bound) ≈ C ÷ BW × (b/2).
+  - kipply, for an A100-40GB (312 TFLOPS / 1.5 TB/s): "we get a distinct ratio here of 208 given this hardware specification." / "Anything below, we're memory bandwidth bound. Above, flops bound."
+  - JAX book: "For bf16 activations on TPU v5e, this is 240 tokens. For an H100, it is about 280 tokens."
+  - Our spec-sheet arithmetic gives 295 for the H100; the JAX book's "about 280" uses slightly different peak figures. Either way, the order of magnitude is **a few hundred sequences**.
+- **MBU** (Databricks): "MBU is defined as (achieved memory bandwidth) / (peak memory bandwidth)" where "achieved memory bandwidth is ((total model parameter size + KV cache size) / TPOT)."
+- **MFU** = achieved FLOP/s ÷ peak FLOP/s.
+
+### Hardware table [DATED Oct 2026; vendor pages]
+
+| Device | Memory | BW | BF16 dense | Ridge (FLOPs/B) | 8B BF16 ceiling, B=1 | 8B 4-bit (≈4.5 bpw, 4.52 GB) ceiling |
+|---|---|---|---|---|---|---|
+| A100 80GB SXM | 80 GB | 2.039 TB/s | 312 TF | 153 | 127 tok/s | 451 |
+| H100 SXM | 80 GB | 3.35 TB/s | 989 TF | 295 | **208** | 741 |
+| H100 PCIe (older brief) | 80 GB | 2.0 TB/s | ~756 TF | ~378 | 125 | 442 |
+| H100 NVL | 94 GB | 3.9 TB/s | ~835 TF | 214 | 243 | 863 |
+| H200 SXM | 141 GB | 4.8 TB/s | 989 TF | 206 | 299 | 1,062 |
+| B200 (DGX B200 ÷ 8) | 180 GB | 8 TB/s | FP8 4.5 PF dense; BF16 ≈2.25 PF [DERIVED, half of FP8] | ~281 | 498 | 1,770 |
+| Apple M4 | ≤32 GB | 120 GB/s | n/p | – | 7.5 | 26.5 |
+| Apple M4 Pro | ≤64 GB | 273 GB/s | n/p | – | 17.0 | 60 |
+| Apple M4 Max (40-core GPU) | ≤128 GB | 546 GB/s | n/p | – | **34.0** | 121 |
+| Apple M5 (Oct 2025) | ≤32 GB | 153 GB/s | n/p | – | 9.5 | 34 |
+| Apple M5 Pro (Mar 2026) | ≤64 GB | 307 GB/s | n/p | – | 19.1 | 68 |
+| Apple M5 Max (40-core GPU, Mar 2026) | ≤128 GB | 614 GB/s | n/p | – | 38.2 | 136 |
+| Apple M3 Ultra (Mar 2025) | ≤512 GB | 819 GB/s | n/p | – | 51 | 181 |
+| Apple M5 Ultra (Aug 2026) | ≤512 GB | 1.2 TB/s | n/p | – | 74.7 | 265 |
+
+Notes on the table:
+- n/p = Apple does not publish GPU TFLOPS. Apple only states relative claims, e.g. M5 has "over 4x the peak GPU compute performance for AI compared to M4", and M5 Ultra "4.3x the peak AI compute performance of M3 Ultra".
+- Ceiling = BW ÷ weight bytes. It ignores KV reads and assumes 100% MBU, so real numbers are 60–90% of it.
+- NVIDIA sources:
+  - H100: "NVIDIA NVLink™: 900GB/s; PCIe Gen5: 128GB/s" (nvidia.com/en-us/data-center/h100).
+  - A100: nvidia.com/en-us/data-center/a100.
+  - H200: nvidia.com/en-us/data-center/h200.
+  - DGX B200: "1,440 GB total, 64 TB/s HBM3e bandwidth"; FP8 "72 PFLOPS" for 8 GPUs, with footnote "Dense performance is ½ sparse spec shown".
+- Apple sources:
+  - Newsroom: M4 Pro/Max 2024-10-30; M5 2025-10-15; M5 Pro/Max 2026-03-03, which says "up to 307GB/s" and "up to 614GB/s"; M5 Ultra 2026-08-25.
+  - M3 Ultra newsroom 2025-03-05.
+  - [UNCERTAIN] Whether the 512 GB M3 Ultra configuration is still sold.
+
+### Worked example 1: "the speed limit is bandwidth ÷ size" [DERIVED]
+1. Llama-3.1-8B in BF16 = 8.03e9 × 2 B = **16.06 GB**.
+2. **H100:** 3.35e12 ÷ 16.06e9 = **208.6 tokens/s** max, i.e. 4.79 ms per token.
+   - Compute needed per token is 16.06 GFLOP ÷ 989e12 = **16 µs**. The GPU's math units are idle about 99.7% of the time at batch 1.
+3. **MacBook Pro M4 Max (546 GB/s):** 546 ÷ 16.06 = **34 tok/s** max. In 4-bit (≈4.52 GB) it is about **121 tok/s** max.
+4. **Base M4 (120 GB/s):** a 16 GB model does not fit usefully on a 16 GB Mac. In 4-bit: 120 ÷ 4.52 ≈ **26.5 tok/s** max.
+
+### Worked example 2: check the ceiling against measurements
+Animation idea: **"multiply speed by size and you get bandwidth".**
+
+llama.cpp Apple Silicon benchmark (github.com/ggml-org/llama.cpp/discussions/4167; LLaMA-2-7B; `llama-bench -p 512 -n 128`). Bytes per token: F16 = 13.48 GB (6.74B × 2); Q4_0 = 3.79 GB (4.5 bpw). M5-generation rows used a newer llama.cpp commit than older rows, so they are not strictly like-for-like.
+
+| Chip (BW) | F16 TG128 | → effective BW (MBU) | Q4_0 TG128 | → eff. BW (MBU) | Q4_0 PP512 |
+|---|---|---|---|---|---|
+| M1 (68 GB/s) | – | – | 14.15 | 54 GB/s (79%) | 118 |
+| M4 (120) | 7.43 | 100 GB/s (83%) | 24.11 | 91 (76%) | 221 |
+| M4 Pro (273) | 17.18 | 232 (85%) | 50.74 | 192 (70%) | 440 |
+| M4 Max (546) | 31.64 | 426 (78%) | 83.06 | 315 (58%) | 886 |
+| M2 Ultra (800) | 41.02 | 553 (69%) | 94.27 | 357 (45%) | 1,238 |
+| M5 (153) | – | – | 31.88 | 121 (79%) | 723 |
+| M5 Max (614) | 37.11 | 500 (81%) | 119.92 | 455 (74%) | 3,220 |
+| M5 Ultra (1,200; table lists 1,228) | 73.60 | 992 (≈83%) | 179.10 | 679 (57%) | 4,945 |
+
+Lessons:
+- **(a) Decode tracks bandwidth.** M5 Max vs M4 Max: TG F16 ×1.17, bandwidth ×1.12.
+- **(b) Prefill tracks compute.** M5 Max vs M4 Max: PP ×3.4–3.6, because the M5 GPU has Neural Accelerators.
+- **(c) Quantized formats use bandwidth less efficiently** (lower MBU), because dequantization costs compute. They still win on absolute speed because they move fewer bytes.
+
+Apple's own confirmation (Apple ML Research, "Exploring LLMs with MLX and the Neural Accelerators in the M5 GPU", 2025-11-19):
+- M5 vs M4: TTFT "up to 4x" faster, generation "19-27%" faster, bandwidth "28% higher".
+- Quote: "generating the first token is compute-bound, and takes full advantage of the Neural Accelerators." / "Generating subsequent tokens is bounded by memory bandwidth, rather than by compute ability."
+
+Apple ML Research, "Local and Distributed Large LLM Inference with MLX and RDMA on Mac Studio" (2026-10-15):
+- "Generation speed (in tokens per second) is memory-bandwidth bound." / "Time to first token (TTFT) is essentially compute bound".
+- Decode, M3 Ultra → M5 Ultra:
+  - Qwen 3.8 (27B dense, BF16): 12.46 → 19.69 tok/s.
+  - Mistral Medium 3.5 (128B, FP8): 4.95 → 7.70.
+- [DERIVED] Ceilings: 27B BF16 = 54 GB, so 819/54 = 15.2 and 1,200/54 = 22.2 tok/s → MBU 82% and 89%. The Mistral model gives 77% and 82%.
+- Caveats: context lengths per cell are unlabeled on the page, and the text's "up to 4.6×" TTFT claim does not match the tables (3.9×, 4.4×).
+
+GPU cross-check (PyTorch "GPT, Fast" blog, 2023):
+- "7B × 2 bytes × 107 tok/s ÷ 2 TB/s" gives "72% MBU! ... even just copying memory struggles to break 85%."
+- That run was on an A100-80GB, "power limited to 330W".
+
+### Common misconceptions
+- "More TFLOPS = faster chatbot." For one user, bandwidth and bytes decide. TFLOPS decide TTFT and big-batch throughput.
+- "nvidia-smi says 100% utilisation, so the GPU is maxed." GPU-Util is the fraction of time *some* kernel was running. GKE's docs say GPU utilization "Does not measure how much work is being done while the GPU is active."
+- "Decode is slow because attention is quadratic." At short context, decode is slow because it re-reads 16 GB of *weights* for every token. At long context, KV reads take over (§3, §11).
+
+### Quotable
+- "inference from large models is often not bottlenecked on arithmetic operations, but rather on memory bandwidth and communication" (Leviathan et al., ICML 2023).
+- "Transformer sampling is typically memory bandwidth bound." (Chen et al., DeepMind, 2023)
+- "for BS=1 every single matrix multiplication in a transformer is actually a matrix vector multiplication ... the computations are completely memory-bandwidth bound." (PyTorch, GPT-Fast blog)
+
+---
+
+## §3 The KV cache
+
+### Mechanism
+Attention for a new token needs the keys and values of *every previous token*, in every layer.
+- **Without a cache**, step t would recompute K and V for all t−1 earlier tokens, so total work grows as O(T²).
+- **With a cache**, each step computes K/V only for the new token and appends them. The past is *read*, not recomputed.
+
+The price is memory: the cache grows linearly with tokens × batch, and **every decode step must read the whole cache of each sequence**.
+
+### Formula
+**KV bytes per token = 2 (K and V) × L × n_kv × d_h × b.**
+- JAX book: "the 2 comes from storing both the keys and values."
+- kipply (for multi-head attention, fp16): "Per token, the number of bytes we store is" 2·2·n_layers·n_heads·d_head = 4·n_layers·d_model.
+- **Per sequence:** × T tokens. **Per server:** × the number of concurrent sequences.
+
+### Worked numbers [DERIVED from configs]
+
+| Model | L | n_kv × d_h | KV/token (BF16) | 8K ctx | 32K | 128K |
+|---|---|---|---|---|---|---|
+| Llama-3.1-8B (GQA, 8 KV heads) | 32 | 8×128 | **128 KiB** | 1 GiB | 4 GiB | **16 GiB** |
+| same model if it were MHA (32 KV heads) | 32 | 32×128 | 512 KiB | 4 GiB | 16 GiB | 64 GiB |
+| Llama-3.1-70B (GQA, 8 KV heads) | 80 | 8×128 | **320 KiB** | 2.5 GiB | 10 GiB | **40 GiB** |
+| same if MHA (64 KV heads) | 80 | 64×128 | 2.5 MiB | 20 GiB | 80 GiB | 320 GiB |
+| OPT-13B (MHA; vLLM paper's example) | 40 | 5120 | 800 KiB ("800 KB") | – | – | – |
+| Llama-3.2-1B (Mac demo model) | 16 | 8×64 | 32 KiB | 256 MiB | 1 GiB | 4 GiB |
+| Qwen3-1.7B (Mac demo model) | 28 | 8×128 | 112 KiB | 896 MiB | 3.5 GiB | (max ctx 40,960) |
+| DeepSeek-V3 (MLA, 671B) | 61 | latent 512 + RoPE key 64 = 576 elements | 68.6 KiB | 0.54 GiB | 2.1 GiB | 8.6 GiB |
+
+Notes on the table:
+- The vLLM paper (§3) confirms the OPT-13B row: "the KV cache of a single token demands 800 KB of space", and one request "can be as much as 1.6 GB".
+- The 576-element figure for MLA is **[DERIVED]** from DeepSeek-V2 §2.1.1 and the V3 config (kv_lora_rank 512, qk_rope_head_dim 64). The papers do not state "576" themselves.
+- **Surprise for the animation:** DeepSeek-V3, an 84× bigger model, stores *less* KV per token than Llama-3.1-8B. And Qwen3-1.7B stores 3.5× more per token than Llama-3.2-1B.
+- JAX book's LLaMA-2-13B example: one 8,192-token bf16 sequence has a 6.7 GB KV cache. "Just 4 of these exceed the memory usage of our parameters!"
+
+### Worked example: "how many Owl conversations fit on one H100?" [DERIVED]
+1. Budget 90% of 80 GB = 72 GB.
+2. Subtract 16.06 GB of weights → **≈ 56 GB for KV**. This ignores activations and CUDA-graph workspace, so real numbers are a bit lower.
+3. 56e9 ÷ 131,072 B/token = **≈ 427,000 token-slots**.
+4. At 8K tokens per conversation: **52 concurrent conversations**.
+5. Compare:
+   - FP8 KV cache: 104.
+   - The same model with MHA: 13.
+   - 128K-token conversations: only 3.
+
+**Decode cost of the cache.** At T = 32K, each step reads 4 GiB (4.3 GB) of KV per sequence on top of the 16 GB of weights, so batch-1 TPOT rises ≈ 27%. At 128K the cache (17.2 GB) is larger than the weights, and the floor TPOT doubles from 4.9 to 9.9 ms.
+
+### Shrinking the cache (one family of ideas, five tricks)
+1. **MQA** (Shazeer 2019, arXiv 1911.02150): one K/V head shared by all query heads.
+   - "keys and values are shared across all of the different attention heads, greatly reducing the size of these tensors and hence the memory bandwidth requirements of incremental decoding."
+2. **GQA** (Ainslie et al., EMNLP 2023, arXiv 2305.13245): groups of query heads share a K/V head. Llama 3 uses 8 KV heads, a 4× saving for 8B and 8× for 70B.
+   - "uptrained GQA achieves quality close to multi-head attention with comparable speed to MQA". Uptraining uses "5% of original pre-training compute".
+3. **MLA** (DeepSeek-V2, arXiv 2405.04434): cache a low-rank latent (512) plus a small decoupled RoPE key (64) instead of full K/V. K/V are reconstructed (absorbed into the projections) at attention time.
+   - "MLA guarantees efficient inference through significantly compressing the Key-Value (KV) cache into a latent vector".
+   - V2 vs DeepSeek 67B: "reduces the KV cache by 93.3%" and "boosts the maximum generation throughput to 5.76 times".
+   - V2 is 236B total / 21B active, with 128K context.
+4. **Sliding-window / local attention.** Layers only attend to the last W tokens, so the cache is a rolling buffer of W entries (slot i mod W).
+   - Mistral 7B (arXiv 2310.06825): W = 4096. "On a sequence length of 32k tokens, this reduces the cache memory usage by 8x, without impacting the model quality."
+   - Gemma 3 (arXiv 2503.19786) interleaves "5 local layers for every global layer" and assigns "a smaller span of only 1024 tokens to the local layers". KV memory overhead falls from "60%" (global-only) to "less than 15%". That measurement was on an ablation configuration (1:3, 2B model), not the shipped 5:1, so cite it carefully.
+5. **KV quantization.**
+   - FP8 KV halves the cache. vLLM docs: `kv_cache_dtype = "fp8" | "fp8_e4m3" | "fp8_e5m2"`; "Quantizing the KV (Key-Value) cache to FP8 format can significantly reduce its memory footprint." Without calibration the scales default to 1.0.
+   - **KIVI** (Liu et al., ICML 2024, arXiv 2402.02750), 2-bit, tuning-free: "the key cache should be quantized per-channel", "the value cache should be quantized per-token".
+   - KIVI results: 2.6× lower peak memory (including weights), up to 4× larger batch, 2.35–3.47× throughput.
+   - Apple's 2025 on-device model: "The KV cache was quantized to 8 bits per weight."
+   - mlx-lm: `--kv-bits`, `--kv-group-size`, `--quantized-kv-start`.
+
+### KV offloading and tiering
+When GPU memory is full, KV blocks can move to CPU DRAM or SSD and come back later. This is cheaper than recomputing a long prefix.
+- **vLLM KV-offloading blog** (2026-01-08; Llama-3.1-8B-Instruct, H100):
+  - "loading KV values from the CPU reduces TTFT by X2-X22, depending on the prompt size".
+  - CPU↔GPU "DMA achieves 83.4 GB/s" bidirectional.
+  - Flags: `--kv_offloading_backend native --kv_offloading_size <GB>` (v0.14.0+).
+- **LMCache** (arXiv 2510.09665) moves KV "across GPU, CPU, storage, and network layers"; "up to 15x improvement in throughput" with vLLM.
+- **Mooncake** (Kimi) "leverages the underutilized CPU, DRAM, and SSD resources of the GPU cluster" (§5).
+- **DeepSeek production** (24 h, Feb 2025): "342B tokens (56.3%) hit the on-disk KV cache".
+- **[DERIVED]** Is moving it worth it? Reloading a 32K-token Llama-8B prefix (4.3 GB) over 41.7 GB/s (one direction of 83.4) takes about **0.10 s**. Recomputing it takes ≈ 2·8.03e9·32K + attention ≈ 0.8 PFLOP, i.e. **≈ 1.6 s at 50% MFU** (§11). That is why offloading pays.
+
+### Misconceptions
+- "The KV cache is an optional speed-up cache, like a CDN." It is the model's working memory for the conversation. Without it, decode cost explodes quadratically.
+- "KV size depends on model size." It depends on L × n_kv × d_h, so attention design dominates (see the DeepSeek-V3 vs Llama-8B row).
+- "Once the weights fit, you're done." On a busy server the KV cache, not the weights, decides how many users fit.
+
+### Quotable
+- "with 8 key-value heads to improve inference speed and to reduce the size of key-value caches during decoding." (Llama 3 Herd of Models, 2024)
+- "Just 4 of these exceed the memory usage of our parameters!" (JAX scaling book, on 8K-token LLaMA-2-13B caches)
+- "reduces the KV cache by 93.3%" (DeepSeek-V2, 2024)
+
+---
+
+## §4 Memory management: PagedAttention, prefix caching, copy-on-write
+
+### Mechanism
+**Before vLLM, servers reserved one contiguous KV region per request**, sized for the *maximum* possible length. Kwon et al. name three kinds of waste:
+- "reserved slots for future tokens";
+- "internal fragmentation due to over-provisioning for potential maximum sequence lengths";
+- "external fragmentation from the memory allocator like the buddy allocator".
+
+**PagedAttention** (Kwon et al., SOSP 2023, arXiv 2309.06180) treats the KV cache like OS virtual memory.
+- KV is stored in fixed-size **blocks** ("vLLM sets its default block size as 16"), which can sit anywhere in GPU memory.
+- A per-request **block table** maps logical blocks to physical blocks. The attention kernel gathers through that table.
+- Memory is allocated block by block as tokens arrive, so the only waste is the unfilled tail of the last block (< 16 slots per sequence).
+- "one can think of blocks as pages, tokens as bytes, and requests as processes."
+
+**Sharing and copy-on-write.**
+- Parallel sampling (n > 1) and beam search share the prompt's physical blocks, with a reference count per block.
+- When a branch needs to write into a shared *partial* block, it gets its own copy: "with the exception of the final logical block, which is managed by a copy-on-write mechanism."
+
+**Prefix caching** keeps the blocks of finished requests and reuses them when a new request starts with the same tokens.
+- **vLLM Automatic Prefix Caching:** "we hash each kv-cache block by the tokens in the block and the tokens in the prefix before the block". "We only cache full blocks." Eviction is LRU. V1 turned it on by default, reporting "near-zero performance degradation, even when the cache hit rate is 0%".
+- **SGLang RadixAttention** (Zheng et al., NeurIPS 2024, arXiv 2312.07104) keeps all cached prefixes in a **radix tree**: "our system maintains an LRU cache of the KV cache for all requests within a radix tree".
+  - Its scheduler is cache-aware: "we sort the requests by matched prefix length and prioritize requests with longer matched prefixes".
+  - Benchmarks: "the cache hit rate ranges from 50% to 99%".
+
+### Numbers (with sources)
+- **Kwon et al.:** existing systems store actual token states in "only 20.4% - 38.2% of the KV cache memory". Throughput is 2–4× FasterTransformer and Orca at similar latency.
+  - Sharing saves "6.1% - 9.8% memory saving on parallel sampling and 37.6% - 55.2% on beam search."
+- **vLLM launch blog** (2023-06-20):
+  - Existing systems "waste 60% – 80% of memory due to fragmentation and over-reservation"; vLLM has "a mere waste of under 4%".
+  - "up to 24x higher throughput than HuggingFace Transformers" and "up to 3.5x higher throughput than TGI".
+  - Parallel-sampling memory is cut "by up to 55%", which "can translate into up to 2.2x improvement in throughput."
+- **SGLang:** up to 6.4× throughput (paper). The Jan 2024 LMSYS blog said "up to 5 times higher throughput". Say which one you quote.
+
+### Worked example (animate with coloured blocks) [DERIVED]
+1. **Old way.** A request may reach 4,096 tokens, so 4,096 slots are reserved (512 MiB for Llama-8B). It finishes at 600 tokens. **85% of the reservation was never used**, and nobody else could use it meanwhile.
+2. **Paged way.** 600 tokens need ⌈600/16⌉ = 38 blocks (608 slots). Only 8 slots are wasted (1.3%).
+3. **Sharing.** Owl's 1,024-token system prompt = exactly 64 blocks. Ask for n = 4 answers of 200 tokens each.
+   - Without sharing: 4 × (1,024 + 200) = 4,896 slots.
+   - With shared prompt blocks: 1,024 + 4 × 200 = 1,824 slots. **63% less.**
+4. **Prefix caching across users.** 1,000 Owl users per minute send the same 1,024-token system prompt. Only the first request prefills it; the other 999 skip 64 blocks of prefill.
+   - 1,024 tokens × 16 GFLOP = 16.4 TFLOP saved per request, about 33 ms of H100 time at 50% MFU.
+5. **Copy-on-write.** Two beams share a half-full block. Beam 2 writes token 9 into it, so the block is copied first and the reference counts are updated.
+
+### Misconceptions
+- "PagedAttention means paging to disk." The core idea is *non-contiguous GPU allocation*. Swapping or offloading is a separate feature (§3, §16).
+- "Prefix caching matches similar prompts." It needs an **exact token-prefix match**, and in vLLM on full 16-token blocks. Changing one token early in the prompt (a timestamp, say) invalidates everything after it. Same lesson as "Agents, Animated": stable content first, variable content last.
+
+### Quotable
+- "only 20.4% - 38.2% of the KV cache memory is used to store the actual token states in the existing systems." (Kwon et al., 2023)
+- "an attention algorithm inspired by the classical virtual memory and paging techniques in operating systems" (Kwon et al., 2023)
+- "retains the KV cache for both prompts and generation results in a radix tree" (LMSYS SGLang blog, Jan 2024)
+
+---
+

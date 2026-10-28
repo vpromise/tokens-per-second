@@ -1,0 +1,7 @@
+Study notes: the KV cache
+
+When a language model writes a reply, it produces one token at a time. To choose each new token, the attention layers need the keys and values of every earlier token in the conversation, in every layer. Without a cache, the model would recompute those keys and values from scratch at every step, so the work would grow with the square of the length. With a cache, each step computes the keys and values only for the newest token and appends them to a store in memory. The past is read, not recomputed.
+
+The price is memory. For Llama-3.1-8B the cache holds 2 x 32 layers x 8 key-value heads x 128 dimensions x 2 bytes, which is 131,072 bytes, or 128 KiB, for every token. A conversation of 8,000 tokens therefore needs about 1 GiB of cache, and a conversation of 128,000 tokens needs about 16 GiB, the same as the weights themselves. Grouped-query attention keeps this small: with 32 key-value heads instead of 8 the cache would be four times larger.
+
+There are several ways to shrink the cache. Quantizing it to 8 bits halves its size, and 4 bits quarters it, with a small loss of accuracy. A sliding window keeps only the most recent tokens and forgets the rest. Prefix caching lets many requests that share the same system prompt reuse one copy of its keys and values. Every decode step must still read the whole cache of each sequence, so a long context makes each new token slower as well as more expensive.

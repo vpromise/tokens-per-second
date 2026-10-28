@@ -1,0 +1,9 @@
+{
+  "\\bPagedAttention\\b": "Paged Attention",
+  "\\bFlashAttention\\b": "Flash Attention",
+  "\\bllama\\.cpp\\b": "llama C P P",
+  "\\bvLLM\\b": "V L L M",
+  "\\bSGLang\\b": "S G Lang",
+  "\\bKiB\\b": "kibibytes",
+  "\\bEAGLE\\b": "Eagle"
+}

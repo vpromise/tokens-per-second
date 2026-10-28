@@ -1,0 +1,34 @@
+# Code-only repository: ignore everything, then let source and docs back in.
+*
+!*/
+!.gitignore
+!*.py
+!*.sh
+!*.md
+!*.json
+!*.txt
+!*.svg
+!*.toml
+!assets/*.png
+
+# Generated media, caches and environments (never committed)
+voice/
+__pycache__/
+.venv*/
+third_party/
+
+# Raw experiment outputs and data (regenerate with the scripts in research/)
+logs/
+raw/
+results/
+arrays/
+images/
+weights/
+ckpt/
+data/
+out/
+preflight/
+preflight2/
+
+# The local index (briefs/make_index.py writes it; links to the MP4s): GitHub shows .github/README.md
+/README.md
